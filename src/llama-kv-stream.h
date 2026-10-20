@@ -63,6 +63,16 @@ class llama_kv_stream {
 public:
     static constexpr uint32_t page_size = 256;
 
+    // Counters are updated by prepare() on its caller thread. They describe
+    // the requested host->device KV stream traffic, not measured PCIe latency.
+    struct traffic {
+        uint64_t ubatches       = 0;
+        uint64_t attended_pages = 0;
+        uint64_t streamed_pages = 0;
+        uint64_t requested_bytes = 0;
+    };
+    traffic traffic_snapshot() const { return traffic_decode; }
+
     // ubatches up to this size (decode and speculative verification, also n-gram drafts) take the backend's paged decode
     // attention; larger ones also get the page runs, for the chunked paged prefill. On the RX 9070 XT the decode kernel's
     // row tiles are the faster of the two up to 96 query tokens (at 64k: 2.3x at 17, 1.2x at 65, 1.1x at 96) and the
@@ -228,6 +238,8 @@ private:
 
     uint64_t layout_id  = 0;
     uint32_t n_streamed = 0; // pages streamed in the current ubatch
+    traffic  traffic_decode;
+    size_t   traffic_bytes_per_page = 0;
     uint32_t tag        = 0; // tag of the current ubatch, counts the ubatches that streamed
     uint64_t n_prepared = 0; // counts every ubatch, streamed or not: a prefetch only serves the ubatch right after its job
 

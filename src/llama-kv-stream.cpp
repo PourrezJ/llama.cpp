@@ -32,6 +32,7 @@ llama_kv_stream::llama_kv_stream(const std::vector<layer> & layers, uint32_t n_s
         host_offs.push_back(size);
         size += (size_t) n_pages*page_size*(row_size(ikv, false) + row_size(ikv, true));
     }
+    traffic_bytes_per_page = size/n_pages;
 
     ggml_backend_buffer_type_t buft = ggml_backend_dev_host_buffer_type(dev);
     if (!buft) {
@@ -353,6 +354,13 @@ void llama_kv_stream::prepare(const std::vector<uint32_t> & cells, uint32_t n_kv
         } else {
             copies.push_back({ p, dst, 1 });
         }
+    }
+
+    if (cells.size() <= decode_max_tokens) {
+        ++traffic_decode.ubatches;
+        traffic_decode.attended_pages += n_att;
+        traffic_decode.streamed_pages += n_streamed;
+        traffic_decode.requested_bytes += (uint64_t) n_streamed*traffic_bytes_per_page;
     }
 
     // packed, the streamed pages must fit the slots (sized in set_backend)

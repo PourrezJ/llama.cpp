@@ -902,6 +902,9 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
     if (params.kv_resident_size_decode > 0 && !params.kv_stream) {
         throw std::invalid_argument("error: --kv-resident-mib-decode requires --kv-stream\n");
     }
+    if (params.kv_resident_autotune && (!params.kv_stream || !params.kv_resident_size_decode)) {
+        throw std::invalid_argument("error: --kv-resident-autotune requires --kv-stream and --kv-resident-mib-decode\n");
+    }
     if (params.kv_stream && params.kv_resident_size == 0) {
         throw std::invalid_argument("error: --kv-stream requires --kv-resident-mib\n");
     }
@@ -2822,6 +2825,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.kv_resident_size_decode = (size_t) value*1024*1024;
         }
     ).set_env("LLAMA_ARG_KV_RESIDENT_MIB_DECODE"));
+    add_opt(common_arg(
+        {"--kv-resident-autotune"},
+        "[EXPERIMENTAL] dynamically trial four decode KV budgets between --kv-resident-mib and "
+        "--kv-resident-mib-decode (maximum). Compare actual decode throughput and page streaming pressure; "
+        "disabled by default",
+        [](common_params & params) {
+            params.kv_resident_autotune = true;
+        }
+    ).set_env("LLAMA_ARG_KV_RESIDENT_AUTOTUNE"));
     add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"

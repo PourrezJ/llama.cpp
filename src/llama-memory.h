@@ -133,6 +133,7 @@ struct llama_memory_i {
 
     // KV streaming: after a decode resize, whether a batch of n_tokens more could stream more pages than the slots hold
     virtual bool kv_stream_needs_resize(uint32_t n_tokens) const { (void) n_tokens; return false; }
+    virtual uint32_t kv_stream_used_cells() const { return 0; }
 
     //
     // state write/read

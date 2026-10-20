@@ -363,7 +363,20 @@ llama_context::llama_context(
     cparams.moe_cache_size = params.moe_cache_size;
     cparams.kv_resident_size = params.kv_resident_size;
     cparams.kv_resident_size_decode = params.kv_resident_size_decode;
+    cparams.kv_resident_autotune     = params.kv_resident_autotune;
     cparams.n_tokens_decode         = std::min(params.n_tokens_decode > 0 ? params.n_tokens_decode : 4u, cparams.n_ubatch);
+    if (cparams.kv_resident_autotune && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP) {
+        if (cparams.kv_resident_size == 0 || cparams.kv_resident_size_decode == 0) {
+            throw std::runtime_error("adaptive decode KV requires a prefill and maximum decode KV budget");
+        }
+        if (cparams.kv_resident_size_decode < cparams.kv_resident_size) {
+            throw std::runtime_error("adaptive decode KV maximum must not be smaller than prefill budget");
+        }
+        if (cparams.n_seq_max != 1) {
+            throw std::runtime_error("adaptive decode KV currently requires a single sequence (-np 1)");
+        }
+        kv_budget_autotune.configure(cparams.kv_resident_size, cparams.kv_resident_size_decode, cparams.n_ctx);
+    }
 
     if (cparams.kv_resident_size > 0 && params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED) {
         throw std::runtime_error("KV streaming requires Flash Attention to be enabled explicitly");
@@ -771,7 +784,9 @@ bool llama_context::switch_phase(bool decode, uint32_t n_tokens_next) {
     sched_need_reserve = true;
     sched_reserve(true);
     if (decode && streams) {
-        return memory->resize_kv_stream(cparams.kv_resident_size_decode, true, n_tokens_next);
+        const size_t budget = cparams.kv_resident_autotune
+                ? kv_budget_autotune.budget() : cparams.kv_resident_size_decode;
+        return memory->resize_kv_stream(budget, true, n_tokens_next);
     }
     return true;
 }
@@ -968,6 +983,30 @@ void llama_context::synchronize() {
     }
 
     ggml_backend_sched_synchronize(sched.get());
+    // Sample the work already synchronized by the caller; no extra GPU stalls.
+    if (cparams.kv_resident_autotune && memory && memory->get_kv_stream()) {
+        const auto traffic = memory->get_kv_stream()->traffic_snapshot();
+        if (phase_decode && n_queued_tokens > 0 && t_compute_start_us > 0) {
+            const uint64_t attended = traffic.attended_pages - kv_prev_attended_pages;
+            const uint64_t streamed = traffic.streamed_pages - kv_prev_streamed_pages;
+            kv_budget_autotune.observe({
+                (uint32_t) n_queued_tokens,
+                memory->kv_stream_used_cells(),
+                (uint64_t) std::max<int64_t>(1, ggml_time_us() - t_compute_start_us),
+                attended,
+                streamed,
+            });
+            if (kv_budget_autotune.wants_resize()) {
+                LLAMA_LOG_INFO("%s: KV autotune requests %zu -> %zu MiB; streamed %llu/%llu pages, used cells %u\n",
+                        __func__, kv_budget_autotune.budget()/llama_kv_budget_autotune::MiB,
+                        kv_budget_autotune.pending_budget()/llama_kv_budget_autotune::MiB,
+                        (unsigned long long) streamed, (unsigned long long) attended,
+                        memory->kv_stream_used_cells());
+            }
+        }
+        kv_prev_attended_pages = traffic.attended_pages;
+        kv_prev_streamed_pages = traffic.streamed_pages;
+    }
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -2018,12 +2057,47 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         bool has_pool = true;
         if (decode_batch != phase_decode && phase_seen_prefill) {
             has_pool = switch_phase(decode_batch, n_tokens_all);
-        } else if ((kv_stream && !kv_stream->has_pool()) || (phase_decode && memory->kv_stream_needs_resize(n_tokens_all))) {
+        } else if ((kv_stream && !kv_stream->has_pool()) || (phase_decode &&
+                (memory->kv_stream_needs_resize(n_tokens_all) ||
+                 (cparams.kv_resident_autotune && kv_budget_autotune.wants_resize())))) {
             // a pool that could not be allocated earlier, or a context that outgrew the decode slots (split the same
             // budget again): allocate the phase's pool, and rebuild the graphs, whose views point into the old one
             synchronize();
-            has_pool = phase_decode ? memory->resize_kv_stream(cparams.kv_resident_size_decode, true, n_tokens_all)
-                                    : memory->resize_kv_stream(cparams.kv_resident_size, false);
+            size_t budget = cparams.kv_resident_size_decode;
+            const bool trial = phase_decode && cparams.kv_resident_autotune && kv_budget_autotune.wants_resize();
+            if (phase_decode && cparams.kv_resident_autotune) {
+                budget = kv_budget_autotune.pending_budget();
+            }
+            // Leave capacity for other GPU users, relative to the detected card
+            // size rather than an arbitrary absolute available-memory threshold.
+            bool enough_free = true;
+            if (trial && budget > kv_budget_autotune.budget() && kv_stream) {
+                size_t free = 0, total = 0;
+                ggml_backend_dev_memory(kv_stream->device(), &free, &total);
+                const size_t headroom = std::max<size_t>(64*llama_kv_budget_autotune::MiB, total/16);
+                const size_t increase = budget - kv_budget_autotune.budget();
+                enough_free = free > headroom && free - headroom >= increase;
+            }
+            if (enough_free) {
+                has_pool = phase_decode ? memory->resize_kv_stream(budget, true, n_tokens_all)
+                                        : memory->resize_kv_stream(cparams.kv_resident_size, false);
+            }
+            if (trial) {
+                kv_budget_autotune.resized(has_pool && enough_free);
+                if (!has_pool && enough_free) {
+                    // A failed allocation frees the old pool. Always restore the
+                    // last working budget before reporting success or retrying.
+                    has_pool = memory->resize_kv_stream(kv_budget_autotune.budget(), true, n_tokens_all);
+                } else if (!enough_free) {
+                    // Even a rejected promotion must satisfy growth of the
+                    // transfer ring for the batch about to run.
+                    has_pool = memory->resize_kv_stream(kv_budget_autotune.budget(), true, n_tokens_all);
+                }
+                LLAMA_LOG_INFO("%s: KV autotune %s at %zu MiB (%u used tokens)\n",
+                        __func__, has_pool ? "pool available" : "allocation failed",
+                        kv_budget_autotune.budget()/llama_kv_budget_autotune::MiB,
+                        memory->kv_stream_used_cells());
+            }
             for (auto & res : gf_res_prev) {
                 if (res) {
                     res->reset();
@@ -4159,6 +4233,7 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.kv_resident_autotune        =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,

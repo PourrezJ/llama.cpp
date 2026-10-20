@@ -7,6 +7,7 @@
 #include "llama-adapter.h"
 #include "llama-impl.h"
 #include "llama-memory.h"
+#include "llama-kv-budget-autotune.h"
 #include "llama-moe-cache.h"
 
 #include "ggml-cpp.h"
@@ -376,6 +377,9 @@ private:
     // pool takes the decode budget; a larger batch switches back to the prefill buffers and pool first
     bool phase_decode       = false;
     bool phase_seen_prefill = false;
+    llama_kv_budget_autotune kv_budget_autotune;
+    uint64_t kv_prev_attended_pages = 0;
+    uint64_t kv_prev_streamed_pages = 0;
 
     // a context created against another one (a draft context, params.ctx_other) follows its phases: the other context
     // switches its followers to decode before it grows its pool into the memory their compute buffers free
