@@ -402,6 +402,7 @@ extern "C" {
         size_t kv_resident_size_decode; // KV streaming: device bytes for the resident pages and the streaming slots between prefills (batches
                                         // of at most n_tokens_decode tokens), when the compute buffers shrink to decode size; also shrinks a
                                         // draft (MTP) context's compute buffers then, 0 = disabled [EXPERIMENTAL]
+        bool kv_resident_adaptive;      // [EXPERIMENTAL] choose decode KV budget in four context quartiles, up to kv_resident_size_decode
         uint32_t n_tokens_decode;       // with kv_resident_size_decode: the largest batch that runs with the decode buffers, e.g. the slots
                                         // times (draft length + 1); 0 = 4
 

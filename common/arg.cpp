@@ -899,6 +899,9 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         throw std::invalid_argument("error: --prompt-cache-all not supported in interactive mode yet\n");
     }
 
+    if (params.kv_resident_adaptive && (!params.kv_stream || !params.kv_resident_size_decode)) {
+        throw std::invalid_argument("error: --kv-resident-adaptive requires --kv-stream and --kv-resident-mib-decode");
+    }
     if (params.kv_resident_size_decode > 0 && !params.kv_stream) {
         throw std::invalid_argument("error: --kv-resident-mib-decode requires --kv-stream\n");
     }
@@ -2822,6 +2825,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.kv_resident_size_decode = (size_t) value*1024*1024;
         }
     ).set_env("LLAMA_ARG_KV_RESIDENT_MIB_DECODE"));
+    add_opt(common_arg(
+        {"--kv-resident-adaptive"},
+        "[EXPERIMENTAL] divide the decode KV budget into four equal steps across the context: 256/512/768/1024 MiB "
+        "for --kv-resident-mib-decode 1024 and -c 131072; prefill budget is unchanged",
+        [](common_params & params) {
+            params.kv_resident_adaptive = true;
+        }
+    ).set_env("LLAMA_ARG_KV_RESIDENT_ADAPTIVE"));
     add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"

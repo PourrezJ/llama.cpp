@@ -1597,9 +1597,13 @@ static uint32_t kv_stream_pages(uint32_t n_cells) {
     return (n_cells + llama_kv_stream::page_size - 1)/llama_kv_stream::page_size;
 }
 
+uint32_t llama_kv_cache::kv_stream_used_cells() const {
+    return std::max(v_cells[0].used_max_p1(), v_heads[0]);
+}
+
 uint32_t llama_kv_cache::kv_stream_pages_next(uint32_t n_tokens) const {
     // the batch goes after the used cells, or after the head if find_slot starts past them; get_n_kv pads the result
-    const uint32_t n_cells   = std::max(v_cells[0].used_max_p1(), v_heads[0]) + n_tokens;
+    const uint32_t n_cells   = kv_stream_used_cells() + n_tokens;
     const uint32_t n_pad_cur = std::max(n_pad, 256u);
     return std::min(kv_stream_pages(get_size()), kv_stream_pages(GGML_PAD(n_cells, n_pad_cur)));
 }

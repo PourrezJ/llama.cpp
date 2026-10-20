@@ -377,6 +377,15 @@ private:
     bool phase_decode       = false;
     bool phase_seen_prefill = false;
 
+    // Active decode KV budget; zero before first decode phase. Only the
+    // streaming leader changes page allocation; MTP followers resize compute
+    // buffers as usual. The adaptive cap prevents repeated OOM thrashing.
+    size_t kv_decode_budget_current = 0;
+    size_t kv_decode_budget_cap     = 0;
+
+    size_t select_decode_kv_budget(uint32_t n_tokens_next) const;
+    bool resize_decode_kv_pool(uint32_t n_tokens_next);
+
     // a context created against another one (a draft context, params.ctx_other) follows its phases: the other context
     // switches its followers to decode before it grows its pool into the memory their compute buffers free
     llama_context *              phase_leader = nullptr;

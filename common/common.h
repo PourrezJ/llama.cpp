@@ -600,6 +600,7 @@ struct common_params {
     bool   kv_stream        = false; // KV streaming [EXPERIMENTAL]: keep the context in host memory, kv_resident_size of it on the GPU
     size_t kv_resident_size = 0;     // device bytes for resident K/V pages
     size_t kv_resident_size_decode = 0; // device bytes for resident K/V pages between prefills, 0 = kv_resident_size
+    bool   kv_resident_adaptive = false; // 4 context quartiles, from 1/4 to full decode budget
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 

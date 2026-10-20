@@ -363,6 +363,7 @@ llama_context::llama_context(
     cparams.moe_cache_size = params.moe_cache_size;
     cparams.kv_resident_size = params.kv_resident_size;
     cparams.kv_resident_size_decode = params.kv_resident_size_decode;
+    cparams.kv_resident_adaptive    = params.kv_resident_adaptive;
     cparams.n_tokens_decode         = std::min(params.n_tokens_decode > 0 ? params.n_tokens_decode : 4u, cparams.n_ubatch);
 
     if (cparams.kv_resident_size > 0 && params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED) {
@@ -747,6 +748,63 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
 }
 
+size_t llama_context::select_decode_kv_budget(uint32_t n_tokens_next) const {
+    const size_t maximum = cparams.kv_resident_size_decode;
+    if (!cparams.kv_resident_adaptive || !memory || !memory->get_kv_stream() || !maximum) {
+        return maximum;
+    }
+    // Four equal context quartiles. For --kv-resident-mib-decode 1024:
+    // <=32K: 256 MiB; <=64K: 512 MiB; <=96K: 768 MiB; >96K: 1024 MiB.
+    const uint64_t context = std::max(uint32_t(1), cparams.n_ctx);
+    const uint64_t used = std::min(context,
+        uint64_t(memory->kv_stream_used_cells()) + n_tokens_next);
+    const size_t step = size_t(std::min<uint64_t>(3, used ? (4*(used - 1))/context : 0)) + 1;
+    const size_t quarter = maximum / 4;
+    const size_t proposed = step == 4 ? maximum : step*quarter;
+    // When shrinking an occupied context, wait until 1024 tokens below the
+    // lower boundary before releasing VRAM (hysteresis). Growing is immediate.
+    if (kv_decode_budget_current > proposed) {
+        const size_t current_step = std::min<size_t>(4,
+            (kv_decode_budget_current + quarter - 1)/std::max<size_t>(quarter, 1));
+        const uint64_t lower_boundary = context*(current_step - 1)/4;
+        if (used + 1024 >= lower_boundary) {
+            return kv_decode_budget_current;
+        }
+    }
+    return proposed;
+}
+
+bool llama_context::resize_decode_kv_pool(uint32_t n_tokens_next) {
+    if (!memory || !memory->get_kv_stream()) {
+        return true;
+    }
+    const size_t quarter = cparams.kv_resident_size_decode / 4;
+    const size_t minimum = cparams.kv_resident_adaptive ? quarter : cparams.kv_resident_size_decode;
+    const size_t desired = select_decode_kv_budget(n_tokens_next);
+    const size_t capped = kv_decode_budget_cap ? std::min(desired, kv_decode_budget_cap) : desired;
+    // A budget that cannot fit in VRAM is retried one quarter smaller (down
+    // to the configured minimum), never leaving an apparently valid stale pool.
+    for (size_t size = capped; size >= minimum && size > 0; size -= std::max<size_t>(quarter, 1)) {
+        if (memory->resize_kv_stream(size, true, n_tokens_next)) {
+            if (cparams.kv_resident_adaptive && size != kv_decode_budget_current) {
+                const llama_kv_stream * stream = memory->get_kv_stream();
+                LLAMA_LOG_INFO("%s: adaptive KV decode budget %zu MiB at %u/%u used tokens; resident %u pages, transfer ring %u pages\n",
+                    __func__, size/(1024*1024), memory->kv_stream_used_cells(), cparams.n_ctx,
+                    stream->n_pool(), stream->n_ring());
+            }
+            kv_decode_budget_current = size;
+            if (size < desired) {
+                kv_decode_budget_cap = size;
+            }
+            return true;
+        }
+        if (!cparams.kv_resident_adaptive) {
+            break;
+        }
+    }
+    return false;
+}
+
 bool llama_context::switch_phase(bool decode, uint32_t n_tokens_next) {
     if (decode == phase_decode) {
         return true;
@@ -771,8 +829,9 @@ bool llama_context::switch_phase(bool decode, uint32_t n_tokens_next) {
     sched_need_reserve = true;
     sched_reserve(true);
     if (decode && streams) {
-        return memory->resize_kv_stream(cparams.kv_resident_size_decode, true, n_tokens_next);
+        return resize_decode_kv_pool(n_tokens_next);
     }
+    kv_decode_budget_current = 0;
     return true;
 }
 
@@ -2018,11 +2077,15 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         bool has_pool = true;
         if (decode_batch != phase_decode && phase_seen_prefill) {
             has_pool = switch_phase(decode_batch, n_tokens_all);
-        } else if ((kv_stream && !kv_stream->has_pool()) || (phase_decode && memory->kv_stream_needs_resize(n_tokens_all))) {
+        } else if ((kv_stream && !kv_stream->has_pool()) ||
+                   (phase_decode && (memory->kv_stream_needs_resize(n_tokens_all) ||
+                    (cparams.kv_resident_adaptive && kv_decode_budget_current !=
+                     std::min(select_decode_kv_budget(n_tokens_all),
+                              kv_decode_budget_cap ? kv_decode_budget_cap : cparams.kv_resident_size_decode))))) {
             // a pool that could not be allocated earlier, or a context that outgrew the decode slots (split the same
             // budget again): allocate the phase's pool, and rebuild the graphs, whose views point into the old one
             synchronize();
-            has_pool = phase_decode ? memory->resize_kv_stream(cparams.kv_resident_size_decode, true, n_tokens_all)
+            has_pool = phase_decode ? resize_decode_kv_pool(n_tokens_all)
                                     : memory->resize_kv_stream(cparams.kv_resident_size, false);
             for (auto & res : gf_res_prev) {
                 if (res) {
@@ -4150,6 +4213,7 @@ llama_context_params llama_context_default_params() {
         /*.moe_cache_size              =*/ 0,
         /*.kv_resident_size            =*/ 0,
         /*.kv_resident_size_decode     =*/ 0,
+        /*.kv_resident_adaptive        =*/ false,
         /*.n_tokens_decode             =*/ 0,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,

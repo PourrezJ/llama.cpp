@@ -81,6 +81,10 @@ bool llama_memory_hybrid::kv_stream_needs_resize(uint32_t n_tokens) const {
     return mem_attn->kv_stream_needs_resize(n_tokens);
 }
 
+uint32_t llama_memory_hybrid::kv_stream_used_cells() const {
+    return mem_attn->kv_stream_used_cells();
+}
+
 llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     do {
         balloc.split_reset();

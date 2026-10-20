@@ -77,6 +77,7 @@ public:
     llama_kv_stream * get_kv_stream() override;
     bool resize_kv_stream(size_t resident_size, bool decode, uint32_t n_tokens) override;
     bool kv_stream_needs_resize(uint32_t n_tokens) const override;
+    uint32_t kv_stream_used_cells() const override;
 
     // state write/load
 
